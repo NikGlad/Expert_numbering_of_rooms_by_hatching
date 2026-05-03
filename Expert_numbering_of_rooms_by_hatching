@@ -1,0 +1,533 @@
+;; ============================================================
+;; Нумерация помещений / коридоров / вестибюлей / тамбуров
+;; Команда: START_NUMROOMS
+;;
+;; Что делает:
+;; - Ищет HATCH со штриховкой GRASS
+;; - Нумерует:
+;;   * помещения (синие)
+;;   * коридоры (зелёные)
+;;   * вестибюли (фиолетовые)
+;;   * тамбуры (голубые)
+;; - Для сложных штриховок ищет точку, которая гарантированно
+;;   лежит внутри границ штриховки
+;; - Создаёт MTEXT в слое "экспертиза номера помещений"
+;; - Высота текста 300
+;; - Цвет красный
+;; - Стиль текста: FZ_TIMES (times.ttf)
+;;
+;; ВАЖНО:
+;; - Перед новой нумерацией удаляет старые TEXT/MTEXT
+;;   в слое "экспертиза номера помещений"
+;; - На одной штриховке создаётся только один уникальный номер
+;; ============================================================
+
+(vl-load-com)
+
+;; ---------- настройки ----------
+(setq *fz_num_layer*              "экспертиза номера помещений")
+(setq *fz_hatch_layer_rooms*      "экспертиза помещения")
+(setq *fz_hatch_layer_passages*   "экспертиза коридоры вестибюли тамбуры")
+(setq *fz_hatch_layer_legacy*     "экспертиза условные обозначения")
+(setq *fz_hatch_pattern*          "GRASS")
+
+(setq *fz_num_text_height*        300.0)
+(setq *fz_num_text_style*         "FZ_TIMES")
+(setq *fz_num_text_font*          "times.ttf")
+(setq *fz_num_text_width*         1000.0)
+
+;; доп. настройки поиска внутренней точки
+(setq *fz_geom_tol*               0.1)
+(setq *fz_ray_y_eps*              0.123456789)
+(setq *fz_probe_grids*            '(3 5 7 11 15 21 31))
+
+;; ---------- цвета зон ----------
+;; TrueColor int = 0x00RRGGBB
+(setq *fz_rgb_blue*    255)        ;; 0,0,255
+(setq *fz_rgb_green*   65280)      ;; 0,255,0
+(setq *fz_rgb_magenta* 16711935)   ;; 255,0,255
+(setq *fz_rgb_cyan*    65535)      ;; 0,255,255
+
+;; ACI fallback
+(setq *fz_aci_blue*    5)
+(setq *fz_aci_green*   3)
+(setq *fz_aci_magenta* 6)
+(setq *fz_aci_cyan*    4)
+
+;; ============================================================
+;; ВСПОМОГАТЕЛЬНЫЕ
+;; ============================================================
+
+(defun fz:trim (s)
+  (vl-string-trim " \t\r\n" (if s s ""))
+)
+
+(defun fz:str-eq-ci (a b)
+  (= (strcase (if a a "")) (strcase (if b b "")))
+)
+
+(defun fz:uniq-add (lst x)
+  (if (member x lst) lst (cons x lst))
+)
+
+(defun fz:vla-object-p (x)
+  (= (type x) 'VLA-OBJECT)
+)
+
+(defun fz:try-variant-value (x / r)
+  (setq r (vl-catch-all-apply 'vlax-variant-value (list x)))
+  (if (vl-catch-all-error-p r) nil r)
+)
+
+(defun fz:try-safearray->list (x / r)
+  (setq r (vl-catch-all-apply 'vlax-safearray->list (list x)))
+  (if (vl-catch-all-error-p r) nil r)
+)
+
+(defun fz:pt-dist2 (p q)
+  (+
+    (* (- (car p)  (car q))  (- (car p)  (car q)))
+    (* (- (cadr p) (cadr q)) (- (cadr p) (cadr q)))
+  )
+)
+
+(defun fz:pt-eq-p (p q tol)
+  (and
+    (<= (abs (- (car p)  (car q))) tol)
+    (<= (abs (- (cadr p) (cadr q))) tol)
+  )
+)
+
+(defun fz:uniq-pt-add (lst pt tol / out found)
+  (setq out lst)
+  (setq found nil)
+  (while out
+    (if (fz:pt-eq-p (car out) pt tol)
+      (setq found T out nil)
+      (setq out (cdr out))
+    )
+  )
+  (if found lst (cons pt lst))
+)
+
+(defun fz:flat->pts (lst / out)
+  (setq out '())
+  (while (and lst (cddr lst))
+    (setq out (cons (list (car lst) (cadr lst) (caddr lst)) out))
+    (setq lst (cdddr lst))
+  )
+  (reverse out)
+)
+
+(defun fz:variant->list-safe (v / vv lst)
+  (cond
+    ((null v) nil)
+    ((setq vv (fz:try-variant-value v))
+      (fz:variant->list-safe vv)
+    )
+    ((setq lst (fz:try-safearray->list v))
+      lst
+    )
+    ((listp v)
+      v
+    )
+    (T nil)
+  )
+)
+
+(defun fz:loop-output->list (x / vv lst out val)
+  (cond
+    ((null x)
+      nil
+    )
+    ((fz:vla-object-p x)
+      (list x)
+    )
+    ((setq vv (fz:try-variant-value x))
+      (fz:loop-output->list vv)
+    )
+    ((setq lst (fz:try-safearray->list x))
+      (progn
+        (setq out '())
+        (foreach val lst
+          (setq out (append out (fz:loop-output->list val)))
+        )
+        out
+      )
+    )
+    ((listp x)
+      (progn
+        (setq out '())
+        (foreach val x
+          (setq out (append out (fz:loop-output->list val)))
+        )
+        out
+      )
+    )
+    (T nil)
+  )
+)
+
+(defun fz:ensure-layer (/ doc layers lay)
+  (setq doc (vla-get-ActiveDocument (vlax-get-acad-object)))
+  (setq layers (vla-get-Layers doc))
+
+  (if (not (tblsearch "LAYER" *fz_num_layer*))
+    (progn
+      (setq lay (vla-Add layers *fz_num_layer*))
+      (vla-put-Color lay 1)
+    )
+    (setq lay (vla-Item layers *fz_num_layer*))
+  )
+
+  lay
+)
+
+(defun fz:ensure-text-style ()
+  (if (not (tblsearch "STYLE" *fz_num_text_style*))
+    (entmakex
+      (list
+        '(0 . "STYLE")
+        '(100 . "AcDbSymbolTableRecord")
+        '(100 . "AcDbTextStyleTableRecord")
+        (cons 2 *fz_num_text_style*)
+        '(70 . 0)
+        '(40 . 0.0)
+        '(41 . 1.0)
+        '(50 . 0.0)
+        '(71 . 0)
+        '(42 . 0.2)
+        (cons 3 *fz_num_text_font*)
+        (cons 4 "")
+      )
+    )
+  )
+)
+
+(defun fz:delete-old-numbers (/ ss i en)
+  (setq ss (ssget "X" (list (cons 0 "TEXT,MTEXT") (cons 8 *fz_num_layer*))))
+  (if ss
+    (progn
+      (setq i 0)
+      (while (< i (sslength ss))
+        (setq en (ssname ss i))
+        (entdel en)
+        (setq i (1+ i))
+      )
+    )
+  )
+)
+
+(defun fz:hatch-color-int (ename / ed c420)
+  (setq ed (entget ename))
+  (setq c420 (cdr (assoc 420 ed)))
+  (if c420 c420 (cdr (assoc 62 ed)))
+)
+
+(defun fz:hatch-pattern-ok-p (ename / ed pat)
+  (setq ed (entget ename))
+  (setq pat (cdr (assoc 2 ed)))
+  (and pat (= (strcase pat) (strcase *fz_hatch_pattern*)))
+)
+
+(defun fz:numberable-hatch-p (ename / c)
+  (setq c (fz:hatch-color-int ename))
+  (or
+    (= c *fz_rgb_blue*)
+    (= c *fz_rgb_green*)
+    (= c *fz_rgb_magenta*)
+    (= c *fz_rgb_cyan*)
+    (= c *fz_aci_blue*)
+    (= c *fz_aci_green*)
+    (= c *fz_aci_magenta*)
+    (= c *fz_aci_cyan*)
+  )
+)
+
+(defun fz:get-bbox (ename / obj min max mn mx)
+  (setq obj (vlax-ename->vla-object ename))
+  (vla-getBoundingBox obj 'min 'max)
+  (setq mn (vlax-safearray->list min))
+  (setq mx (vlax-safearray->list max))
+  (list (car mn) (cadr mn) (car mx) (cadr mx))
+)
+
+(defun fz:bbox-center (bb)
+  (list
+    (/ (+ (nth 0 bb) (nth 2 bb)) 2.0)
+    (/ (+ (nth 1 bb) (nth 3 bb)) 2.0)
+    0.0
+  )
+)
+
+(defun fz:handle-str (ename / ed)
+  (setq ed (entget ename))
+  (cdr (assoc 5 ed))
+)
+
+(defun fz:hatch-item-less-p (a b / p1 p2 x1 y1 x2 y2)
+  ;; сортировка: сверху вниз, при равенстве слева направо
+  (setq p1 (cadr a))
+  (setq p2 (cadr b))
+  (setq x1 (car p1))
+  (setq y1 (cadr p1))
+  (setq x2 (car p2))
+  (setq y2 (cadr p2))
+
+  (if (= y1 y2)
+    (< x1 x2)
+    (> y1 y2)
+  )
+)
+
+(defun fz:collect-numberable-hatches (/ layers out seen layer ss i en bb ctr hnd)
+  (setq layers (list *fz_hatch_layer_rooms* *fz_hatch_layer_passages* *fz_hatch_layer_legacy*))
+  (setq out '())
+  (setq seen '())
+
+  (foreach layer layers
+    (if (and layer (> (strlen layer) 0))
+      (progn
+        (setq ss (ssget "X" (list (cons 0 "HATCH") (cons 8 layer))))
+        (if ss
+          (progn
+            (setq i 0)
+            (while (< i (sslength ss))
+              (setq en (ssname ss i))
+              (setq hnd (fz:handle-str en))
+
+              (if (and
+                    (not (member hnd seen))
+                    (fz:hatch-pattern-ok-p en)
+                    (fz:numberable-hatch-p en)
+                  )
+                (progn
+                  (setq bb (fz:get-bbox en))
+                  (setq ctr (fz:bbox-center bb))
+                  (setq out (cons (list en ctr hnd) out))
+                  (setq seen (cons hnd seen))
+                )
+              )
+
+              (setq i (1+ i))
+            )
+          )
+        )
+      )
+    )
+  )
+
+  (vl-sort out 'fz:hatch-item-less-p)
+)
+
+(defun fz:get-target-space (/ doc)
+  (setq doc (vla-get-ActiveDocument (vlax-get-acad-object)))
+  (if (= (getvar "CVPORT") 1)
+    (if (= (getvar "TILEMODE") 0)
+      (vla-get-PaperSpace doc)
+      (vla-get-ModelSpace doc)
+    )
+    (vla-get-ModelSpace doc)
+  )
+)
+
+(defun fz:get-entity-space (ename / doc ed)
+  (setq doc (vla-get-ActiveDocument (vlax-get-acad-object)))
+  (setq ed (entget ename))
+  (if (= (cdr (assoc 67 ed)) 1)
+    (vla-get-PaperSpace doc)
+    (vla-get-ModelSpace doc)
+  )
+)
+
+(defun fz:add-number-mtext (pt txt / space obj)
+  (setq space (fz:get-target-space))
+  (setq obj (vla-AddMText space (vlax-3d-point pt) *fz_num_text_width* txt))
+
+  (vla-put-Layer obj *fz_num_layer*)
+  (vla-put-StyleName obj *fz_num_text_style*)
+  (vla-put-Height obj *fz_num_text_height*)
+  (vla-put-Color obj 1)
+  (vla-put-AttachmentPoint obj 5)
+  (vla-put-Lineweight obj -1)
+
+  obj
+)
+
+;; ============================================================
+;; ГЕОМЕТРИЯ: поиск точки, гарантированно лежащей в штриховке
+;; ============================================================
+
+(defun fz:get-hatch-loop-objects (ename / hatch n i loopObjs res out)
+  (setq hatch (vlax-ename->vla-object ename))
+  (setq n (vla-get-NumberOfLoops hatch))
+  (setq i 0)
+  (setq out '())
+
+  (while (< i n)
+    (setq res (vl-catch-all-apply 'vla-GetLoopAt (list hatch i 'loopObjs)))
+    (if (not (vl-catch-all-error-p res))
+      (setq out (append out (fz:loop-output->list loopObjs)))
+    )
+    (setq i (1+ i))
+  )
+
+  out
+)
+
+(defun fz:point-on-obj-p (obj pt tol / cp)
+  (setq cp (vl-catch-all-apply 'vlax-curve-getClosestPointTo (list obj pt)))
+  (if (vl-catch-all-error-p cp)
+    nil
+    (<= (fz:pt-dist2 pt cp) (* tol tol))
+  )
+)
+
+(defun fz:count-ray-intersections (objs ray / raw lst pts all)
+  (setq all '())
+  (foreach obj objs
+    (setq raw (vl-catch-all-apply 'vlax-invoke-method (list obj 'IntersectWith ray 0)))
+    (if (not (vl-catch-all-error-p raw))
+      (progn
+        (setq lst (fz:variant->list-safe raw))
+        (setq pts (fz:flat->pts lst))
+        (foreach p pts
+          (setq all (fz:uniq-pt-add all p *fz_geom_tol*))
+        )
+      )
+    )
+  )
+  (length all)
+)
+
+(defun fz:point-in-hatch-by-loops-p (objs space bb pt / onb x1 y1 x2 y2 w farx p1 p2 ray cnt)
+  (setq onb nil)
+  (foreach obj objs
+    (if (and (not onb) (fz:point-on-obj-p obj pt *fz_geom_tol*))
+      (setq onb T)
+    )
+  )
+
+  (if onb
+    T
+    (progn
+      (setq x1 (nth 0 bb))
+      (setq y1 (nth 1 bb))
+      (setq x2 (nth 2 bb))
+      (setq y2 (nth 3 bb))
+      (setq w  (- x2 x1))
+      (setq farx (+ x2 (max 1000.0 (* 2.0 (max w 1.0)))))
+      (setq p1 (list (car pt) (+ (cadr pt) *fz_ray_y_eps*) 0.0))
+      (setq p2 (list farx    (+ (cadr pt) *fz_ray_y_eps*) 0.0))
+
+      (setq ray (vla-AddLine space (vlax-3d-point p1) (vlax-3d-point p2)))
+      (setq cnt (fz:count-ray-intersections objs ray))
+      (vla-Delete ray)
+
+      (= (rem cnt 2) 1)
+    )
+  )
+)
+
+(defun fz:best-grid-point-inside (objs space bb ctr n / x1 y1 x2 y2 dx dy ix iy pt best bestd d)
+  (setq x1 (nth 0 bb))
+  (setq y1 (nth 1 bb))
+  (setq x2 (nth 2 bb))
+  (setq y2 (nth 3 bb))
+
+  (setq dx (/ (- x2 x1) (+ n 1.0)))
+  (setq dy (/ (- y2 y1) (+ n 1.0)))
+
+  (setq ix 1)
+  (setq best nil)
+  (setq bestd nil)
+
+  (while (<= ix n)
+    (setq iy 1)
+    (while (<= iy n)
+      (setq pt (list (+ x1 (* ix dx)) (+ y1 (* iy dy)) 0.0))
+      (if (fz:point-in-hatch-by-loops-p objs space bb pt)
+        (progn
+          (setq d (fz:pt-dist2 pt ctr))
+          (if (or (null best) (< d bestd))
+            (progn
+              (setq best pt)
+              (setq bestd d)
+            )
+          )
+        )
+      )
+      (setq iy (1+ iy))
+    )
+    (setq ix (1+ ix))
+  )
+
+  best
+)
+
+(defun fz:get-safe-number-point (ename / bb ctr objs space grids best)
+  (setq bb    (fz:get-bbox ename))
+  (setq ctr   (fz:bbox-center bb))
+  (setq objs  (fz:get-hatch-loop-objects ename))
+  (setq space (fz:get-entity-space ename))
+
+  (if (null objs)
+    ctr
+    (if (fz:point-in-hatch-by-loops-p objs space bb ctr)
+      ctr
+      (progn
+        (setq grids *fz_probe_grids*)
+        (setq best nil)
+
+        (while (and grids (null best))
+          (setq best (fz:best-grid-point-inside objs space bb ctr (car grids)))
+          (setq grids (cdr grids))
+        )
+
+        (if best best ctr)
+      )
+    )
+  )
+)
+
+;; ============================================================
+;; КОМАНДА
+;; ============================================================
+
+(defun c:START_NUMROOMS (/ hatches item en inspt num cnt)
+  (princ "\n--- Нумерация штриховок помещений/коридоров/вестибюлей/тамбуров ---")
+
+  (fz:ensure-layer)
+  (fz:ensure-text-style)
+  (fz:delete-old-numbers)
+
+  (setq hatches (fz:collect-numberable-hatches))
+
+  (if (or (null hatches) (= (length hatches) 0))
+    (progn
+      (princ "\nПодходящие штриховки не найдены.")
+      (princ)
+    )
+    (progn
+      (setq num 1)
+      (setq cnt 0)
+
+      (foreach item hatches
+        (setq en    (car item))
+        (setq inspt (fz:get-safe-number-point en))
+        (fz:add-number-mtext inspt (itoa num))
+        (setq num (1+ num))
+        (setq cnt (1+ cnt))
+      )
+
+      (princ (strcat "\nГотово. Пронумеровано штриховок: " (itoa cnt)))
+      (princ (strcat "\nСлой номеров: " *fz_num_layer*))
+      (princ (strcat "\nСтиль текста: " *fz_num_text_style*))
+      (princ (strcat "\nВысота текста: " (rtos *fz_num_text_height* 2 0)))
+      (princ)
+    )
+  )
+)
+
+(princ "\nЗагружено. Команда: START_NUMROOMS")
+(princ)
